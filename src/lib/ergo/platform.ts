@@ -8,8 +8,11 @@ import { buy_refund } from './actions/buy_refund';
 import { rebalance } from './actions/rebalance';
 import { explorer_uri, network_id } from './envs';
 import { address, connected, network, balance } from "../common/store";
+import { activeWallet, walletConnected } from './wallets/registry';
 import { temp_exchange } from './actions/temp_exchange';
 import { type contract_version } from './contract';
+import type { ErgoWalletAdapter } from './wallets/types';
+import { get } from 'svelte/store';
 
 export class ErgoPlatform implements Platform {
 
@@ -18,77 +21,125 @@ export class ErgoPlatform implements Platform {
     icon = "";
     time_per_block = 2*60*1000;  // every 2 minutes
     last_version: contract_version = "v1_1";
+    private currentWallet: ErgoWalletAdapter | null = null;
 
-    async connect(): Promise<void> {
-        if (typeof ergoConnector !== 'undefined') {
-            const nautilus = ergoConnector.nautilus;
-            if (nautilus) {
-                if (await nautilus.connect()) {
-                    console.log('Connected!');
-                    address.set(await ergo.get_change_address());
-                    network.set((network_id == "mainnet") ? "ergo-mainnet" : "ergo-testnet");
-                    await this.get_balance();
-                    connected.set(true);
-                } else {
-                    alert('Not connected!');
-                }
+    constructor() {
+        // Subscribe to the activeWallet store to keep track of the current wallet
+        activeWallet.subscribe((wallet) => {
+            this.currentWallet = wallet;
+        });
+    }
+
+    async connect(walletAdapter?: ErgoWalletAdapter): Promise<void> {
+        // If a specific wallet adapter is provided, use it
+        if (walletAdapter) {
+            const isConnected = await walletAdapter.connect();
+            if (isConnected) {
+                activeWallet.set(walletAdapter);
+                walletConnected.set(true);
+                address.set(await walletAdapter.getChangeAddress());
+                network.set((network_id == "mainnet") ? "ergo-mainnet" : "ergo-testnet");
+                await this.get_balance();
+                connected.set(true);
             } else {
-                alert('Nautilus Wallet is not active');
+                throw new Error(`Failed to connect to ${walletAdapter.info.name}`);
             }
-            } /*else {
-                alert('No wallet available');
-            } */
+            return;
+        }
+
+        // If we have a previously connected wallet, try to reconnect
+        const currentWalletValue = get(activeWallet);
+        if (currentWalletValue) {
+            const isConnected = await currentWalletValue.isConnected();
+            if (isConnected) {
+                walletConnected.set(true);
+                address.set(await currentWalletValue.getChangeAddress());
+                network.set((network_id == "mainnet") ? "ergo-mainnet" : "ergo-testnet");
+                await this.get_balance();
+                connected.set(true);
+                return;
+            }
+        }
+
+        // No wallet connected or connection failed
+        connected.set(false);
+        walletConnected.set(false);
+    }
+
+    async disconnect(): Promise<void> {
+        if (this.currentWallet) {
+            await this.currentWallet.disconnect();
+            activeWallet.set(null);
+            walletConnected.set(false);
+            connected.set(false);
+            address.set('');
+        }
     }
 
     async get_current_height(): Promise<number> {
-        try {
-            // If connected to the Ergo wallet, get the current height directly
-            return await ergo.get_current_height();
-        } catch {
-            // Fallback to fetching the current height from the Ergo API
+        if (this.currentWallet) {
             try {
-                const response = await fetch(explorer_uri+'/api/v1/networkState');
-                if (!response.ok) {
-                    throw new Error(`API request failed with status: ${response.status}`);
-                }
-    
-                const data = await response.json();
-                return data.height; // Extract and return the height
+                // If connected to a wallet, get the current height directly
+                return await this.currentWallet.getCurrentHeight();
             } catch (error) {
-                console.error("Failed to fetch network height from API:", error);
-                throw new Error("Unable to get current height.");
+                console.error("Failed to get height from wallet:", error);
+                // Fall through to API fallback
             }
+        }
+        
+        // Fallback to fetching the current height from the Ergo API
+        try {
+            const response = await fetch(explorer_uri+'/api/v1/networkState');
+            if (!response.ok) {
+                throw new Error(`API request failed with status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            return data.height; // Extract and return the height
+        } catch (error) {
+            console.error("Failed to fetch network height from API:", error);
+            throw new Error("Unable to get current height.");
         }
     }
 
     async get_balance(id?: string): Promise<Map<string, number>> {
         const balanceMap = new Map<string, number>();
-        const addr = await ergo.get_change_address();
-
-        if (addr) {
-            try {
-                // Fetch balance for the specific address from the API
-                const response = await fetch(explorer_uri+`/api/v1/addresses/${addr}/balance/confirmed`);
-                if (!response.ok) {
-                    throw new Error(`API request failed with status: ${response.status}`);
+        
+        if (!this.currentWallet) {
+            throw new Error("No wallet connected");
+        }
+        
+        try {
+            const addr = await this.currentWallet.getChangeAddress();
+            
+            if (addr) {
+                try {
+                    // Fetch balance for the specific address from the API
+                    const response = await fetch(explorer_uri+`/api/v1/addresses/${addr}/balance/confirmed`);
+                    if (!response.ok) {
+                        throw new Error(`API request failed with status: ${response.status}`);
+                    }
+        
+                    const data = await response.json();
+        
+                    // Add nanoErgs balance to the map
+                    balanceMap.set("ERG", data.nanoErgs);
+                    balance.set(data.nanoErgs)
+        
+                    // Add tokens balances to the map
+                    data.tokens.forEach((token: { tokenId: string; amount: number }) => {
+                        balanceMap.set(token.tokenId, token.amount);
+                    });
+                } catch (error) {
+                    console.error(`Failed to fetch balance for address ${addr} from API:`, error);
+                    throw new Error("Unable to fetch balance.");
                 }
-    
-                const data = await response.json();
-    
-                // Add nanoErgs balance to the map
-                balanceMap.set("ERG", data.nanoErgs);
-                balance.set(data.nanoErgs)
-    
-                // Add tokens balances to the map
-                data.tokens.forEach((token: { tokenId: string; amount: number }) => {
-                    balanceMap.set(token.tokenId, token.amount);
-                });
-            } catch (error) {
-                console.error(`Failed to fetch balance for address ${addr} from API:`, error);
-                throw new Error("Unable to fetch balance.");
+            } else {
+                throw new Error("Address is required to fetch balance.");
             }
-        } else {
-            throw new Error("Address is required to fetch balance.");
+        } catch (error) {
+            console.error("Failed to get wallet address:", error);
+            throw new Error("Failed to get wallet address");
         }
     
         return balanceMap;

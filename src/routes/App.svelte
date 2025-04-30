@@ -20,7 +20,7 @@
     import * as Alert from "$lib/components/ui/alert";
     import { get } from 'svelte/store';
     import { fade } from 'svelte/transition';
-
+    import { WalletSelector } from '$lib/components/wallet';
 
     let activeTab = 'acquireTokens';
     let showCopyMessage = false;
@@ -31,6 +31,7 @@
 
     onMount(async () => {
         if (!browser) return;
+        // Auto-reconnect logic is handled in the platform.connect()
         await platform.connect();
 
         const projectId = $page.url.searchParams.get('project');
@@ -78,11 +79,7 @@
         }
     }
 
-    function disconnect() {
-        if ($address) {
-            
-        }
-    }
+    // Disconnect function is now handled by the WalletSelector component
 
     // Close the modal if the user clicks outside of it
     function handleOutsideClick(event: MouseEvent) {
@@ -187,6 +184,7 @@
 
         <!-- User Info and Theme -->
         <div class="user-section">
+            <WalletSelector {platform} />
             {#if $address}
                 <div class="user-info">
                     <div class="badge-container">
@@ -293,8 +291,7 @@
         <Dialog.Footer>
         <Button
         disabled
-        class={buttonVariants({ variant: "outline" })}
-        on:click={disconnect}>
+        class={buttonVariants({ variant: "outline" })}>
             Disconnect
         </Button>
         </Dialog.Footer>
