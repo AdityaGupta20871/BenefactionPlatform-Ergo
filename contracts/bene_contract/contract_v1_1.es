@@ -23,7 +23,7 @@
 // R4: Int                   The block height until which withdrawals or refunds are disallowed. After this height, they are permitted.
 // R5: Long                  The minimum number of tokens that must be sold to trigger certain actions (e.g., withdrawals).
 // R6: Coll[Long]      The total number of tokens sold, the total number of tokens refunded and the total number of APT changed per PFT so far.
-// R7: Long                  The ERG-to-token exchange rate (ERG per token).
+// R7: Coll[Byte]            A tuple containing (Base Token ID, Exchange Rate) - Base Token ID is empty string for ERG.
 // R8: Coll[Byte]            Base58-encoded JSON string containing the contract owner's details.
 // R9: Coll[Byte]            Base58-encoded JSON string containing project metadata, including "title" and "description".
 
@@ -152,7 +152,16 @@
   val selfSoldCounter = SELF.R6[Coll[Long]].get(0)
   val selfRefundCounter = SELF.R6[Coll[Long]].get(1)
   val selfAuxiliarExchangeCounter = SELF.R6[Coll[Long]].get(2)
-  val selfExchangeRate = SELF.R7[Long].get
+  val selfR7Data = SELF.R7[Coll[Byte]].get
+  val selfBaseTokenId = if (selfR7Data.size > 8) selfR7Data.slice(0, selfR7Data.size - 8) else Coll[Byte]()
+  val selfExchangeRate = byteArrayToLong(selfR7Data.slice(selfR7Data.size - 8, selfR7Data.size))
+
+  def byteArrayToLong(bytes: Coll[Byte]): Long = {
+    val res = bytes.foldLeft(0L) { (res, b) =>
+      (res << 8) | (b & 0xFFL)
+    }
+    res
+  }
   val selfOwnerDetails = SELF.R8[Coll[Byte]].get
   val selfProjectMetadata = SELF.R9[Coll[Byte]].get
   val selfScript = SELF.propositionBytes
@@ -169,8 +178,8 @@
     // The minimum amount of tokens sold must be the same
     val sameMinimumSold = selfMinimumTokensSold == OUTPUTS(0).R5[Long].get
 
-    // The ERG/Token exchange rate must be same
-    val sameExchangeRate = selfExchangeRate == OUTPUTS(0).R7[Long].get
+    // The base token ID and exchange rate must be the same
+    val sameR7Data = selfR7Data == OUTPUTS(0).R7[Coll[Byte]].get
 
     // The constants must be the same
     val sameConstants = selfOwnerDetails == OUTPUTS(0).R8[Coll[Byte]].get
@@ -185,7 +194,7 @@
     val noAddsOtherTokens = OUTPUTS(0).tokens.size == 1 || OUTPUTS(0).tokens.size == 2
 
     // Verify that the output box is a valid copy of the input box
-    sameId && sameBlockLimit && sameMinimumSold && sameExchangeRate && sameConstants && sameProjectContent && sameScript && noAddsOtherTokens
+    sameId && sameBlockLimit && sameMinimumSold && sameR7Data && sameConstants && sameProjectContent && sameScript && noAddsOtherTokens
   }
 
   val APTokenRemainsConstant = selfAPT == OUTPUTS(0).tokens(0)._2
@@ -261,16 +270,32 @@
 
     val onlyTemporaryUnsoldTokens = deltaTokenRemoved <= temporaryFundingTokenAmountOnContract(SELF)
     
-    // Verify if the ERG amount matches the required exchange rate for the given token quantity
+    // Verify if the base token amount matches the required exchange rate for the given token quantity
     val correctExchange = {
-
-      // Delta of ergs added value from the user's ERG payment
-      val deltaValueAdded = OUTPUTS(0).value - selfValue
-      
-      // ERG / Token exchange rate
-      val exchangeRate = selfExchangeRate
-
-      deltaValueAdded == deltaTokenRemoved * exchangeRate
+      if (selfBaseTokenId.size == 0) {
+        // For ERG-based projects
+        // Delta of ergs added from the user's payment
+        val deltaValueAdded = OUTPUTS(0).value - selfValue
+        deltaValueAdded == deltaTokenRemoved * selfExchangeRate
+      } else {
+        // For token-based projects
+        // Check if the base token exists in both input and output
+        val baseTokenInSelf = SELF.tokens.exists { t => t._1 == selfBaseTokenId }
+        val baseTokenInOutput = OUTPUTS(0).tokens.exists { t => t._1 == selfBaseTokenId }
+        
+        if (baseTokenInSelf && baseTokenInOutput) {
+          val selfBaseTokenAmount = SELF.tokens.find { t => t._1 == selfBaseTokenId }.get._2
+          val outputBaseTokenAmount = OUTPUTS(0).tokens.find { t => t._1 == selfBaseTokenId }.get._2
+          
+          // Calculate delta of base tokens added
+          val deltaBaseTokenAdded = outputBaseTokenAmount - selfBaseTokenAmount
+          
+          // Verify correct exchange rate
+          deltaBaseTokenAdded == deltaTokenRemoved * selfExchangeRate
+        } else {
+          false
+        }
+      }
     }
 
     // Verify if the token sold counter (R6)._1 is increased in proportion of the tokens sold.
@@ -336,15 +361,39 @@
       outputAlreadyTokens - selfAPT
     }
 
-    // Verify if the ERG amount matches the required exchange rate for the returned token quantity
+    // Verify if the base token amount matches the required exchange rate for the returned token quantity
     val correctExchange = {
-      // Calculate the value returned from the contract to the user
-      val retiredValueFromTheContract = selfValue - OUTPUTS(0).value
+      if (selfBaseTokenId.size == 0) {
+        // For ERG-based projects
+        // Calculate the value returned from the contract to the user
+        val retiredValueFromTheContract = selfValue - OUTPUTS(0).value
 
-      // Calculate the value of the tokens added on the contract by the user
-      val addedTokensValue = deltaTokenAdded * selfExchangeRate
+        // Calculate the value of the tokens added on the contract by the user
+        val addedTokensValue = deltaTokenAdded * selfExchangeRate
 
-      retiredValueFromTheContract == addedTokensValue
+        retiredValueFromTheContract == addedTokensValue
+      } else {
+        // For token-based projects
+        // Check if the base token exists in both input and output
+        val baseTokenInSelf = SELF.tokens.exists { t => t._1 == selfBaseTokenId }
+        val baseTokenInOutput = OUTPUTS(0).tokens.exists { t => t._1 == selfBaseTokenId }
+        
+        if (baseTokenInSelf && baseTokenInOutput) {
+          val selfBaseTokenAmount = SELF.tokens.find { t => t._1 == selfBaseTokenId }.get._2
+          val outputBaseTokenAmount = OUTPUTS(0).tokens.find { t => t._1 == selfBaseTokenId }.get._2
+          
+          // Calculate delta of base tokens returned
+          val deltaBaseTokenReturned = selfBaseTokenAmount - outputBaseTokenAmount
+          
+          // Calculate the value of the tokens added on the contract by the user
+          val addedTokensValue = deltaTokenAdded * selfExchangeRate
+          
+          // Verify correct exchange rate
+          deltaBaseTokenReturned == addedTokensValue
+        } else {
+          false
+        }
+      }
     }
 
     // Verify if the token refund counter (R6)._2 is increased in proportion of the tokens refunded.
@@ -573,9 +622,12 @@
       if (SELF.tokens.size == 1) true 
       else SELF.tokens(1)._1 == fromBase16("`+token_id+`")
     
-    val onlyOneOrAnyToken = SELF.tokens.size == 1 || SELF.tokens.size == 2
+    // Allow one more token for the base token if it's not ERG
+    val maxTokens = if (selfBaseTokenId.size == 0) 2 else 3
+    
+    val validTokenCount = SELF.tokens.size >= 1 && SELF.tokens.size <= maxTokens
 
-    correctTokenId && onlyOneOrAnyToken
+    correctTokenId && validTokenCount
   }
 
   sigmaProp(correctBuild && actions)
